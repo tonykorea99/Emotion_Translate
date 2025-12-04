@@ -13,8 +13,6 @@ from collections import Counter
 # ---------------------------------------------------------
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
-# [!!! 중요 !!!] W&B API Key 설정
 os.environ["WANDB_API_KEY"] = "e758b93c3e805dafd9d187ec1c0b1b984fe6256f"
 
 from datasets import Dataset, DatasetDict, load_dataset, concatenate_datasets
@@ -37,12 +35,9 @@ CSV_PATHS = [
     "/home/hail/emotionproject/datasets/japanese_emotions.csv",
 ]
 
-# JSONL 저장 경로 (결과 확인용 - 용량 작음)
-JSONL_DIR = "./wrime_jsonl_jp_bert"
-
-# 모델 설정
-MODEL_NAME = "cl-tohoku/bert-base-japanese-v3"   
-M2M_MODEL_NAME = "facebook/m2m100_418M" # 테스트용
+# 🟢 [수정] Large 모델 적용 (성능 극대화)
+MODEL_NAME = "cl-tohoku/bert-large-japanese-v2"   
+M2M_MODEL_NAME = "facebook/m2m100_418M" 
 
 EMO_LABELS = [
     "Joy", "Sadness", "Anticipation", "Surprise", 
@@ -51,20 +46,22 @@ EMO_LABELS = [
 id2label = {i: lab for i, lab in enumerate(EMO_LABELS)}
 label2id = {lab: i for i, lab in id2label.items()}
 
-# 하이퍼파라미터
-BATCH_SIZE = 32       
-EVAL_BATCH_SIZE = 64  
-LR = 2e-5             
-NUM_EPOCHS = 3        # 3 에폭 고정
+# 🟢 [수정] 배치 줄임 (Large 모델 메모리 때문) & 에폭 늘림
+BATCH_SIZE = 16       
+EVAL_BATCH_SIZE = 32  
+LR = 1e-5             # Large 모델은 더 세심하게 학습 (2e-5 -> 1e-5)
+NUM_EPOCHS = 5        # 5 에폭 도전
 MAX_LEN = 128
 SEED = 42
 LOG_INTERVAL = 10        
 VALIDATION_INTERVAL = 100 
 
-# W&B 설정
+# 🟢 [핵심] 확실한 감정만 학습 (강도 2 이상)
+EMOTION_INTENSITY_THRESHOLD = 2 
+
 WANDB_ENTITY = "hails"
 WANDB_PROJECT = "Emotional_Traslate_Bert_m2m100"
-WANDB_RUN_NAME = "JP_BERT_Direct_NoSave_Epoch3" 
+WANDB_RUN_NAME = "JP_Large_Filtered_Data_Final" 
 
 # ---------------------------------------------------------
 # 2. 유틸리티 함수
@@ -102,17 +99,11 @@ def compute_metrics_detailed(all_labels: list, all_preds: list) -> dict:
     return result
 
 # ---------------------------------------------------------
-# 3. 데이터 로드 및 전처리
+# 3. 데이터 로드 및 전처리 (필터링 적용)
 # ---------------------------------------------------------
 def process_csv_data(csv_paths: list) -> DatasetDict:
     all_datasets = []
-    RAW_TO_EMO_MAP = {
-        "happy": "Joy", "sad": "Sadness", "anger": "Anger", "fear": "Fear", 
-        "disgust": "Disgust", "surprise": "Surprise", 
-        "joy": "Joy", "sadness": "Sadness", "anticipation": "Anticipation", 
-        "trust": "Trust",
-    }
-
+    # (외부 데이터는 강도 정보가 없으므로 그대로 사용)
     for path in csv_paths:
         if not os.path.exists(path): continue
         try: df = pd.read_csv(path)
@@ -126,9 +117,11 @@ def process_csv_data(csv_paths: list) -> DatasetDict:
         if 'Sentence_std' in df.columns and 'raw_label' in df.columns:
             def map_and_filter(row):
                 raw = str(row['raw_label']).strip().lower()
-                mapped_label = RAW_TO_EMO_MAP.get(raw, None)
-                if mapped_label in EMO_LABELS:
-                    row['labels'] = label2id[mapped_label]
+                # 간단 매핑 (필요시 수정)
+                mapping = {"happy":"Joy", "sad":"Sadness", "anger":"Anger", "fear":"Fear", "disgust":"Disgust", "surprise":"Surprise", "joy":"Joy", "sadness":"Sadness", "trust":"Trust", "anticipation":"Anticipation"}
+                mapped = mapping.get(raw)
+                if mapped in EMO_LABELS:
+                    row['labels'] = label2id[mapped]
                     return row
                 return None 
             
@@ -148,9 +141,6 @@ def process_csv_data(csv_paths: list) -> DatasetDict:
 
 
 def prepare_datasets(csv_paths: list):
-    """
-    [수정] 디스크 저장(캐싱) 없이 메모리에서만 처리
-    """
     print("\n[Data] WRIME 및 외부 데이터 로드 중...")
     
     # 1. WRIME 로드
@@ -159,11 +149,18 @@ def prepare_datasets(csv_paths: list):
     
     def wrime_process(ex):
         scores = [ex[c] for c in WRIME_SCORE_COLS]
+        max_score = int(np.max(scores)) 
         ex["labels"] = int(np.argmax(scores)) 
+        ex["max_intensity"] = max_score # 강도 저장
         ex["Sentence_std"] = ex.get("Sentence", "")
         return ex
 
     raw_wrime = raw_wrime.map(wrime_process)
+    
+    # 🟢 [필터링] 확실한 감정만 남기기
+    print(f" -> 필터링 전: {len(raw_wrime)}개")
+    raw_wrime = raw_wrime.filter(lambda x: x["max_intensity"] >= EMOTION_INTENSITY_THRESHOLD)
+    print(f" -> 필터링 후 (Intensity >= {EMOTION_INTENSITY_THRESHOLD}): {len(raw_wrime)}개")
     
     wrime_splits = {
         "train": raw_wrime.filter(lambda x: x["Train/Dev/Test"]=="train"),
@@ -184,10 +181,10 @@ def prepare_datasets(csv_paths: list):
         "test": concatenate_datasets([wrime_splits["test"], csv_splits["test_csv"]])
     })
 
-    print(f" -> Train: {len(dataset['train'])} | Val: {len(dataset['validation'])} | Test: {len(dataset['test'])}")
+    print(f" -> Final Train: {len(dataset['train'])} | Val: {len(dataset['validation'])} | Test: {len(dataset['test'])}")
 
     # 4. 토큰화
-    print(f"\n[Tokenizer] 일본어 BERT 토크나이저 적용: {MODEL_NAME}")
+    print(f"\n[Tokenizer] 모델: {MODEL_NAME}")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
     def tokenize_function(examples):
@@ -200,8 +197,6 @@ def prepare_datasets(csv_paths: list):
 
     tokenized_datasets = dataset.map(tokenize_function, batched=True)
     tokenized_datasets.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
-    
-    # 🟢 [수정] save_to_disk 제거됨 (서버 부담 X)
     
     return tokenized_datasets, tokenizer
 
@@ -262,7 +257,7 @@ def main():
         project=WANDB_PROJECT,
         name=WANDB_RUN_NAME,
         config={
-            "architecture": "JP BERT Direct (No Save)", 
+            "architecture": "JP Large + Filter(Int>=2)", 
             "model": MODEL_NAME,
             "batch_size": BATCH_SIZE, 
             "lr": LR, 
@@ -270,7 +265,7 @@ def main():
         },
     )
 
-    # 데이터 준비 (저장 없이 메모리 로드)
+    # 데이터 준비
     tokenized_datasets, tokenizer = prepare_datasets(CSV_PATHS)
     
     data_collator = DataCollatorWithPadding(tokenizer)
@@ -296,7 +291,7 @@ def main():
     print(f" -> Class Weights: {weights}")
 
     # 모델 로드
-    print(f"\n[Main] 일본어 BERT 모델 로드: {MODEL_NAME}")
+    print(f"\n[Main] 일본어 Large BERT 로드: {MODEL_NAME}")
     model = AutoModelForSequenceClassification.from_pretrained(
         MODEL_NAME, 
         num_labels=len(EMO_LABELS), 
@@ -311,7 +306,8 @@ def main():
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(total_steps * 0.1), num_training_steps=total_steps)
     
     global_step = 0
-    final_model_path = "./JP_BERT_Epoch3_Final" # 최종 모델만 딱 한번 저장
+    best_val_acc = 0.0
+    final_model_path = "./JP_Large_Filtered_Best"
 
     print(f"\n[Main] 학습 시작... (Epochs: {NUM_EPOCHS})")
 
@@ -344,11 +340,18 @@ def main():
             wandb.log({"train/loss": loss.item(), "train/lr": scheduler.get_last_lr()[0]}, step=global_step)
             
             if global_step % LOG_INTERVAL == 0:
-                print(f"   [Epoch {epoch+1}] Step {global_step}/{total_steps} | Loss: {loss.item():.4f} | LR: {scheduler.get_last_lr()[0]:.8f}")
+                print(f"   [Epoch {epoch+1}] Step {global_step}/{total_steps} | Loss: {loss.item():.4f}")
             
             if global_step > 0 and global_step % VALIDATION_INTERVAL == 0:
                 val_loss, val_acc, _ = evaluate(model, val_loader, device, "val", global_step)
-                print(f"   >>> [Validation] Loss: {val_loss:.4f}, Acc: {val_acc:.4f}")
+                print(f"   >>> [Val] Loss: {val_loss:.4f}, Acc: {val_acc:.4f}")
+                
+                # Acc 기준 저장
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    print(f"      ★ Best Acc Updated! ({best_val_acc:.4f})")
+                    model.save_pretrained(final_model_path)
+                    tokenizer.save_pretrained(final_model_path)
 
             global_step += 1
 
@@ -362,27 +365,31 @@ def main():
         
         val_loss, val_acc, _ = evaluate(model, val_loader, device, "val", global_step)
         print(f"[Epoch {epoch+1}] Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}")
+        
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            model.save_pretrained(final_model_path)
+            tokenizer.save_pretrained(final_model_path)
 
-    print("\n[Main] 학습 종료. 최종 모델만 저장합니다.")
-    model.save_pretrained(final_model_path)
-    tokenizer.save_pretrained(final_model_path)
+    print(f"\n[Main] 학습 종료. 최고 성능({best_val_acc:.4f}) 모델을 로드하여 테스트합니다.")
+    best_model = AutoModelForSequenceClassification.from_pretrained(final_model_path)
+    best_model.to(device)
 
     print("\n[Main] 최종 테스트 평가...")
-    test_loss, test_acc, _ = evaluate(model, test_loader, device, "test", global_step)
+    test_loss, test_acc, _ = evaluate(best_model, test_loader, device, "test", global_step)
     print(f"[TEST] Loss: {test_loss:.4f}, Acc: {test_acc:.4f}")
 
     wandb.finish()
 
     # ---------------------------------------------------------
-    # 6. 실시간 테스트 (한국어 지원을 위한 M2M + JP BERT)
+    # 6. 실시간 테스트
     # ---------------------------------------------------------
-    print("\n--- 실시간 감정 분석 테스트 (JP Model) ---")
-    print(" * M2M100 번역기 로드 중 (한국어 입력 대응용)...")
+    print("\n--- 실시간 감정 분석 테스트 (Large Model) ---")
     m2m_tokenizer = AutoTokenizer.from_pretrained(M2M_MODEL_NAME, src_lang="ko")
     m2m_model = AutoModelForSeq2SeqLM.from_pretrained(M2M_MODEL_NAME).to(device)
     m2m_model.eval()
     
-    model.eval()
+    best_model.eval()
     
     RE_KOREAN = re.compile(r'[가-힣]')
 
@@ -408,7 +415,7 @@ def main():
 
             inputs = tokenizer(final_input_text, return_tensors="pt", truncation=True, max_length=MAX_LEN).to(device)
             with torch.no_grad():
-                logits = model(**inputs).logits
+                logits = best_model(**inputs).logits
             
             pred_id = torch.argmax(logits, dim=-1).item()
             print(f" [예측 감정] {id2label[pred_id]}")
